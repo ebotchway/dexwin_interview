@@ -1,0 +1,50 @@
+{
+  "assessment_ts": "2026-07-15T09:00:00Z",
+  "rejected": {
+    "total": 0,
+    "by_source": {},
+    "reasons": []
+  },
+  "quarantined": {
+    "total": 1,
+    "orphan_order_lines": 0,
+    "orphan_status_events": 0,
+    "orphan_delivery_events": 1
+  },
+  "duplicate": {
+    "total_extra_rows": 3,
+    "order_lines": 1,
+    "order_status_events": 1,
+    "delivery_events": 1
+  },
+  "corrected": {
+    "total": 3,
+    "order_lines": 1,
+    "order_status_events": 1,
+    "delivery_events": 1
+  },
+  "unmatched": {
+    "order_lines_unknown_product": 1
+  },
+  "source_row_counts": {
+    "orders": 30,
+    "order_lines": 72,
+    "order_status_events": 68,
+    "products": 6,
+    "delivery_events": 55
+  },
+  "authoritative_row_counts": {
+    "orders": 30,
+    "products": 6,
+    "order_lines": 70,
+    "order_status_events": 66,
+    "delivery_events": 53
+  },
+  "staged_row_counts": {
+    "orders": 30,
+    "products": 6,
+    "order_lines": 72,
+    "order_status_events": 68,
+    "delivery_events": 55
+  }
+}
