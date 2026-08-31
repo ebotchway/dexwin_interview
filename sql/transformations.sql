@@ -1,0 +1,2 @@
+-- Keep the principal SQL transformations here, or replace this file with a
+-- clearly organised set of SQL files. Document any engine-specific syntax.
