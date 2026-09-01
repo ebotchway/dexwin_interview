@@ -1,2 +1,17 @@
-# The starter uses only the Python standard library.
-# Add pinned free/local dependencies if your solution requires them.
+# No third-party Python dependencies are required.
+# The pipeline uses only Python 3.10+ standard-library modules.
+#
+# Standard library modules used include:
+# argparse
+# csv
+# json
+# sqlite3
+# sys
+# collections
+# datetime
+# decimal
+# pathlib
+# typing
+# re
+#
+# Python 3.10+

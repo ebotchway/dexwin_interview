@@ -13,8 +13,9 @@ import sqlite3
 import sys
 from collections import Counter
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 ASSESSMENT_TS = "2026-07-15T09:00:00Z"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -75,6 +76,12 @@ class PipelineError(Exception):
     """Fatal input or schema problem; stop the run."""
 
 
+# A rejection is one (source, line number, message) triple. One malformed row
+# can produce several messages; the report counts rejected rows and validation
+# errors separately so "rejected" is never ambiguous.
+Rejection = tuple[str, int, str]
+
+
 def parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -89,21 +96,26 @@ def require_columns(source: str, present: Iterable[str], required: Sequence[str]
         raise PipelineError(f"{source}: missing required columns: {', '.join(missing)}")
 
 
-def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+def read_csv(path: Path) -> tuple[list[str], list[tuple[int, dict[str, str]]]]:
+    """Return (header, [(file line number, row)]); line 1 is the header."""
     if not path.is_file():
         raise PipelineError(f"source file not found: {path}")
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise PipelineError(f"{path.name}: missing header row")
-        rows = [{k: (v if v is not None else "") for k, v in row.items()} for row in reader]
+        rows = [
+            (line_no, {k: (v if v is not None else "") for k, v in row.items()})
+            for line_no, row in enumerate(reader, start=2)
+        ]
     return list(reader.fieldnames), rows
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
+def read_jsonl(path: Path) -> list[tuple[int, dict[str, Any]]]:
+    """Return [(file line number, record)]; fatal error on malformed JSON."""
     if not path.is_file():
         raise PipelineError(f"source file not found: {path}")
-    records: list[dict[str, Any]] = []
+    records: list[tuple[int, dict[str, Any]]] = []
     with path.open(encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
@@ -114,113 +126,140 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise PipelineError(f"{path.name} line {line_no}: invalid JSON ({exc})") from exc
             if not isinstance(payload, dict):
                 raise PipelineError(f"{path.name} line {line_no}: expected a JSON object")
-            records.append(payload)
+            records.append((line_no, payload))
     return records
 
 
-def validate_timestamp(source: str, field: str, row: Mapping[str, Any], rejected: list[str]) -> bool:
+def check_id(row: Mapping[str, Any], field: str, errors: list[str]) -> None:
+    if is_blank(row.get(field)):
+        errors.append(f"missing {field}")
+
+
+def check_timestamp(row: Mapping[str, Any], field: str, errors: list[str]) -> None:
     value = str(row.get(field, "")).strip()
     if is_blank(value):
-        rejected.append(f"{source}: missing {field}")
-        return False
+        errors.append(f"missing {field}")
+        return
     try:
         parse_timestamp(value)
     except ValueError:
-        rejected.append(f"{source}: invalid {field}")
-        return False
-    return True
+        errors.append(f"invalid {field}")
 
 
-def validate_number(source: str, field: str, row: Mapping[str, Any], rejected: list[str]) -> bool:
+def check_decimal(
+    row: Mapping[str, Any],
+    field: str,
+    errors: list[str],
+    *,
+    non_negative: bool = False,
+) -> None:
+    """Strict numeric validation.
+
+    float() would accept NaN/Infinity spellings; Decimal rejects odd
+    literals (e.g. underscores) and is_finite() blocks NaN/+/-Inf.
+    Monetary and quantity fields are non-negative in this domain because
+    the assignment models corrections and cancellations through new versions
+    and CANCELLED events, never through signed line amounts.
+    """
     value = str(row.get(field, "")).strip()
     if is_blank(value):
-        rejected.append(f"{source}: missing {field}")
-        return False
+        errors.append(f"missing {field}")
+        return
     try:
-        float(value)
-    except ValueError:
-        rejected.append(f"{source}: invalid {field}")
-        return False
-    return True
+        number = Decimal(value)
+    except InvalidOperation:
+        errors.append(f"invalid {field}")
+        return
+    if not number.is_finite():
+        errors.append(f"non-finite {field}")
+    elif non_negative and number < 0:
+        errors.append(f"negative {field}")
 
 
-def require_id(source: str, field: str, row: Mapping[str, Any], rejected: list[str]) -> bool:
-    if is_blank(row.get(field)):
-        rejected.append(f"{source}: missing {field}")
-        return False
-    return True
+def check_enum(row: Mapping[str, Any], field: str, allowed: frozenset[str], errors: list[str]) -> None:
+    if str(row.get(field, "")).strip() not in allowed:
+        errors.append(f"unrecognised {field}")
 
 
-def validate_orders(rows: list[dict[str, str]], rejected: list[str]) -> list[dict[str, str]]:
-    kept: list[dict[str, str]] = []
-    for row in rows:
-        ok = True
-        for field in ("order_id", "store_id"):
-            ok = require_id("orders", field, row, rejected) and ok
-        ok = validate_timestamp("orders", "ordered_at", row, rejected) and ok
-        ok = validate_timestamp("orders", "promised_delivery_at", row, rejected) and ok
-        if ok:
-            kept.append(row)
+def check_order_row(row: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    check_id(row, "order_id", errors)
+    check_id(row, "store_id", errors)
+    check_timestamp(row, "ordered_at", errors)
+    check_timestamp(row, "promised_delivery_at", errors)
+    return errors
+
+
+def check_line_row(row: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    check_id(row, "line_id", errors)
+    check_id(row, "order_id", errors)
+    check_id(row, "product_id", errors)
+    for field in ("quantity", "unit_price", "discount_amount"):
+        check_decimal(row, field, errors, non_negative=True)
+    check_timestamp(row, "updated_at", errors)
+    return errors
+
+
+def check_status_row(row: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    check_id(row, "event_id", errors)
+    check_id(row, "order_id", errors)
+    check_enum(row, "status", ALLOWED_STATUSES, errors)
+    check_timestamp(row, "event_ts", errors)
+    check_timestamp(row, "updated_at", errors)
+    return errors
+
+
+def check_product_row(row: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    check_id(row, "product_id", errors)
+    check_decimal(row, "unit_cost", errors, non_negative=True)
+    return errors
+
+
+def check_delivery_row(row: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    # Every record must independently carry the expected object structure;
+    # only the first record used to be schema-checked.
+    missing_keys = [key for key in DELIVERY_COLUMNS if key not in row]
+    if missing_keys:
+        errors.append(f"missing required field(s): {', '.join(missing_keys)}")
+    check_id(row, "event_id", errors)
+    check_id(row, "order_id", errors)
+    check_enum(row, "event_type", ALLOWED_DELIVERY_TYPES, errors)
+    check_timestamp(row, "event_ts", errors)
+    check_timestamp(row, "updated_at", errors)
+    return errors
+
+
+def validate_records(
+    source: str,
+    rows: Sequence[tuple[int, Mapping[str, Any]]],
+    check: Any,
+    rejected: list[Rejection],
+) -> list[dict[str, Any]]:
+    """Keep structurally valid rows; record every failed row once per error.
+
+    Rejections here are data-quality findings (bad timestamps, unknown
+    status words, missing ids) and are reported, not fatal. Fatal problems
+    (missing files, missing CSV columns, malformed JSON) raise upstream.
+    """
+    kept: list[dict[str, Any]] = []
+    for line_no, row in rows:
+        errors = check(row)
+        if errors:
+            rejected.extend((source, line_no, message) for message in errors)
+        else:
+            kept.append(dict(row))
     return kept
 
 
-def validate_lines(rows: list[dict[str, str]], rejected: list[str]) -> list[dict[str, str]]:
-    kept: list[dict[str, str]] = []
-    for row in rows:
-        ok = True
-        for field in ("line_id", "order_id", "product_id"):
-            ok = require_id("order_lines", field, row, rejected) and ok
-        for field in ("quantity", "unit_price", "discount_amount"):
-            ok = validate_number("order_lines", field, row, rejected) and ok
-        ok = validate_timestamp("order_lines", "updated_at", row, rejected) and ok
-        if ok:
-            kept.append(row)
-    return kept
-
-
-def validate_status(rows: list[dict[str, str]], rejected: list[str]) -> list[dict[str, str]]:
-    kept: list[dict[str, str]] = []
-    for row in rows:
-        ok = True
-        for field in ("event_id", "order_id"):
-            ok = require_id("order_status_events", field, row, rejected) and ok
-        status = str(row.get("status", "")).strip()
-        if status not in ALLOWED_STATUSES:
-            rejected.append("order_status_events: unrecognised status")
-            ok = False
-        ok = validate_timestamp("order_status_events", "event_ts", row, rejected) and ok
-        ok = validate_timestamp("order_status_events", "updated_at", row, rejected) and ok
-        if ok:
-            kept.append(row)
-    return kept
-
-
-def validate_products(rows: list[dict[str, str]], rejected: list[str]) -> list[dict[str, str]]:
-    kept: list[dict[str, str]] = []
-    for row in rows:
-        ok = require_id("products", "product_id", row, rejected)
-        ok = validate_number("products", "unit_cost", row, rejected) and ok
-        if ok:
-            kept.append(row)
-    return kept
-
-
-def validate_deliveries(rows: list[dict[str, Any]], rejected: list[str]) -> list[dict[str, str]]:
-    kept: list[dict[str, str]] = []
-    for row in rows:
-        normalised = {key: "" if row.get(key) is None else str(row.get(key)) for key in DELIVERY_COLUMNS}
-        ok = True
-        for field in ("event_id", "order_id"):
-            ok = require_id("delivery_events", field, normalised, rejected) and ok
-        event_type = normalised["event_type"].strip()
-        if event_type not in ALLOWED_DELIVERY_TYPES:
-            rejected.append("delivery_events: unrecognised event_type")
-            ok = False
-        ok = validate_timestamp("delivery_events", "event_ts", normalised, rejected) and ok
-        ok = validate_timestamp("delivery_events", "updated_at", normalised, rejected) and ok
-        if ok:
-            kept.append(normalised)
-    return kept
+def normalise_rows(rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> list[dict[str, str]]:
+    return [
+        {key: "" if row.get(key) is None else str(row.get(key)).strip() for key in columns}
+        for row in rows
+    ]
 
 
 def create_staging(conn: sqlite3.Connection) -> None:
@@ -396,11 +435,12 @@ def export_alerts(conn: sqlite3.Connection, path: Path) -> list[dict[str, Any]]:
 
 def build_quality_report(
     conn: sqlite3.Connection,
-    rejected: Sequence[str],
+    rejected: Sequence[Rejection],
     raw_counts: Mapping[str, int],
 ) -> dict[str, Any]:
     dq = {metric: value for metric, value in conn.execute("SELECT metric, value FROM result_dq_counts")}
-    rejected_by_source = Counter(item.split(":", 1)[0] for item in rejected)
+    rejected_rows = sorted({(source, line_no) for source, line_no, _ in rejected})
+    rejected_by_source = Counter(source for source, _ in rejected_rows)
     duplicate_total = (
         dq["duplicate_order_lines"]
         + dq["duplicate_order_status_events"]
@@ -419,9 +459,13 @@ def build_quality_report(
     return {
         "assessment_ts": ASSESSMENT_TS,
         "rejected": {
-            "total": len(rejected),
+            "rows": len(rejected_rows),
+            "validation_errors": len(rejected),
             "by_source": dict(sorted(rejected_by_source.items())),
-            "reasons": sorted(rejected),
+            "errors": [
+                {"source": source, "line": line_no, "message": message}
+                for source, line_no, message in sorted(rejected)
+            ],
         },
         "quarantined": {
             "total": quarantined_total,
@@ -476,8 +520,7 @@ def run(data_dir: Path, output_dir: Path) -> None:
     require_columns("order_lines.csv", line_fields, LINE_COLUMNS)
     require_columns("order_status_events.csv", status_fields, STATUS_COLUMNS)
     require_columns("products.csv", product_fields, PRODUCT_COLUMNS)
-    if delivery_rows:
-        require_columns("delivery_events.jsonl", delivery_rows[0].keys(), DELIVERY_COLUMNS)
+    # delivery_events.jsonl has no header; its schema is checked per record.
 
     raw_counts = {
         "orders": len(order_rows),
@@ -487,12 +530,15 @@ def run(data_dir: Path, output_dir: Path) -> None:
         "delivery_events": len(delivery_rows),
     }
 
-    rejected: list[str] = []
-    orders = validate_orders(order_rows, rejected)
-    lines = validate_lines(line_rows, rejected)
-    status = validate_status(status_rows, rejected)
-    products = validate_products(product_rows, rejected)
-    deliveries = validate_deliveries(delivery_rows, rejected)
+    rejected: list[Rejection] = []
+    orders = validate_records("orders", order_rows, check_order_row, rejected)
+    lines = validate_records("order_lines", line_rows, check_line_row, rejected)
+    status = validate_records("order_status_events", status_rows, check_status_row, rejected)
+    products = validate_records("products", product_rows, check_product_row, rejected)
+    deliveries = normalise_rows(
+        validate_records("delivery_events", delivery_rows, check_delivery_row, rejected),
+        DELIVERY_COLUMNS,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(":memory:")

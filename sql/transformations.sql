@@ -23,11 +23,16 @@ DROP VIEW IF EXISTS v_order_lines_ranked;
 
 -- ---------------------------------------------------------------------------
 -- Raw / current versioned records
--- Latest updated_at wins. rowid breaks ties so the first loaded row is kept
--- when two rows share the same version timestamp (exact duplicates).
+-- Latest updated_at (source-system version clock) wins; rowid breaks ties so
+-- the first loaded row is kept when two rows share the same version
+-- timestamp (exact duplicates). Business timestamps (event_ts, ordered_at)
+-- are never used for version selection.
+-- Versioning happens FIRST, everywhere; business validity checks
+-- (event_ts >= ordered_at, known order) run only on the authoritative rows
+-- below, so a corrected later version can repair an originally invalid event
+-- without special-casing any order.
 -- ---------------------------------------------------------------------------
 
-DROP VIEW IF EXISTS v_order_lines_ranked;
 CREATE VIEW v_order_lines_ranked AS
 SELECT
     line_id,
@@ -43,7 +48,6 @@ SELECT
     ) AS version_rank
 FROM staging_order_lines;
 
-DROP VIEW IF EXISTS v_current_order_lines;
 CREATE VIEW v_current_order_lines AS
 SELECT
     line_id,
@@ -56,7 +60,6 @@ SELECT
 FROM v_order_lines_ranked
 WHERE version_rank = 1;
 
-DROP VIEW IF EXISTS v_status_ranked;
 CREATE VIEW v_status_ranked AS
 SELECT
     event_id,
@@ -70,7 +73,6 @@ SELECT
     ) AS version_rank
 FROM staging_order_status_events;
 
-DROP VIEW IF EXISTS v_current_status_events;
 CREATE VIEW v_current_status_events AS
 SELECT
     event_id,
@@ -81,7 +83,6 @@ SELECT
 FROM v_status_ranked
 WHERE version_rank = 1;
 
-DROP VIEW IF EXISTS v_delivery_ranked;
 CREATE VIEW v_delivery_ranked AS
 SELECT
     event_id,
@@ -95,7 +96,6 @@ SELECT
     ) AS version_rank
 FROM staging_delivery_events;
 
-DROP VIEW IF EXISTS v_current_delivery_events;
 CREATE VIEW v_current_delivery_events AS
 SELECT
     event_id,
@@ -112,7 +112,6 @@ WHERE version_rank = 1;
 -- known gross profit is NULL when unit_cost is unknown, never coerced to 0.
 -- ---------------------------------------------------------------------------
 
-DROP VIEW IF EXISTS v_line_facts;
 CREATE VIEW v_line_facts AS
 SELECT
     l.line_id,
@@ -137,7 +136,6 @@ INNER JOIN staging_orders AS o
 LEFT JOIN staging_products AS p
     ON p.product_id = l.product_id;
 
-DROP VIEW IF EXISTS v_order_amounts;
 CREATE VIEW v_order_amounts AS
 SELECT
     order_id,
@@ -152,7 +150,6 @@ GROUP BY order_id;
 -- Valid means the event attaches to a known order and is not before ordered_at.
 -- ---------------------------------------------------------------------------
 
-DROP VIEW IF EXISTS v_first_completed;
 CREATE VIEW v_first_completed AS
 SELECT
     s.order_id,
@@ -164,7 +161,6 @@ WHERE s.status = 'COMPLETED'
   AND s.event_ts >= o.ordered_at
 GROUP BY s.order_id;
 
-DROP VIEW IF EXISTS v_first_cancelled;
 CREATE VIEW v_first_cancelled AS
 SELECT
     s.order_id,
@@ -176,7 +172,6 @@ WHERE s.status = 'CANCELLED'
   AND s.event_ts >= o.ordered_at
 GROUP BY s.order_id;
 
-DROP VIEW IF EXISTS v_order_revenue;
 CREATE VIEW v_order_revenue AS
 SELECT
     o.order_id,
@@ -211,7 +206,6 @@ LEFT JOIN v_first_cancelled AS x
 -- Entire extract: no assessment-time cutoff. Recognition date = event_ts date.
 -- ---------------------------------------------------------------------------
 
-DROP TABLE IF EXISTS result_revenue_events;
 CREATE TABLE result_revenue_events AS
 SELECT
     substr(r.completed_ts, 1, 10) AS event_date,
@@ -241,7 +235,6 @@ WHERE r.recognise_reversal = 1;
 -- First valid DELIVERED event per known order. Orphans stay out of this view.
 -- ---------------------------------------------------------------------------
 
-DROP VIEW IF EXISTS v_delivery_facts;
 CREATE VIEW v_delivery_facts AS
 SELECT
     o.order_id,
@@ -266,7 +259,6 @@ INNER JOIN (
 ) AS d
     ON d.order_id = o.order_id;
 
-DROP VIEW IF EXISTS v_asof_delivery;
 CREATE VIEW v_asof_delivery AS
 SELECT
     s.order_id,
@@ -286,7 +278,6 @@ GROUP BY s.order_id;
 -- Cancelled orders are not excluded.
 -- ---------------------------------------------------------------------------
 
-DROP TABLE IF EXISTS result_delayed_delivery_alerts;
 CREATE TABLE result_delayed_delivery_alerts AS
 SELECT
     o.order_id,
@@ -322,7 +313,6 @@ WHERE
 -- (full extract, not as-of). Rate is NULL when delivered_orders = 0.
 -- ---------------------------------------------------------------------------
 
-DROP TABLE IF EXISTS result_daily_store_metrics;
 CREATE TABLE result_daily_store_metrics AS
 WITH keys AS (
     SELECT event_date AS metric_date, store_id
@@ -379,7 +369,6 @@ LEFT JOIN del AS d
 -- Corrected: superseded rows that differ from the kept row (later version).
 -- ---------------------------------------------------------------------------
 
-DROP TABLE IF EXISTS result_dq_counts;
 CREATE TABLE result_dq_counts AS
 SELECT 'duplicate_order_lines' AS metric, COUNT(*) AS value
 FROM v_order_lines_ranked AS extra

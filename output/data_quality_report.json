@@ -1,9 +1,10 @@
 {
   "assessment_ts": "2026-07-15T09:00:00Z",
   "rejected": {
-    "total": 0,
+    "rows": 0,
+    "validation_errors": 0,
     "by_source": {},
-    "reasons": []
+    "errors": []
   },
   "quarantined": {
     "total": 1,
