@@ -25,3 +25,6 @@ __pycache__/
 
 # Temporary files
 *.tmp
+
+# Jupyter
+.ipynb_checkpoints/

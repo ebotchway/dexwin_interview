@@ -1,17 +1,20 @@
-# No third-party Python dependencies are required.
-# The pipeline uses only Python 3.10+ standard-library modules.
+# The production pipeline (src/pipeline.py + sql/transformations.sql) needs
+# NO third-party packages: Python 3.10+ standard library only (argparse, csv,
+# json, sqlite3, sys, collections, datetime, decimal, pathlib, typing, re).
 #
-# Standard library modules used include:
-# argparse
-# csv
-# json
-# sqlite3
-# sys
-# collections
-# datetime
-# decimal
-# pathlib
-# typing
-# re
+# The pins below are for the notebooks/ investigation environment only and
+# were verified on CPython 3.13.5 (pandas 3.x requires Python >= 3.11).
+# The committed notebook itself imports only the standard library + sqlite3;
+# pandas/matplotlib/seaborn are installed so reviewers can extend the
+# analysis in the same environment.
 #
-# Python 3.10+
+# Setup:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#   .venv/bin/jupyter notebook notebooks/data_investigation.ipynb
+
+notebook==7.6.2
+ipykernel==7.3.0
+pandas==3.0.5
+matplotlib==3.11.1
+seaborn==0.13.2

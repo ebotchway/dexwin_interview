@@ -103,12 +103,13 @@ immutable raw retention provide recovery.
 
 At 100x volume, SQLite full reload is no longer suitable. Changes: incremental
 ingestion keyed on arrival windows; partitioning analytical tables by business
-date with partition pruning; bulk loading (PolyBase/COPY INTO); columnar
-storage for scan efficiency; incremental merges into versioned and fact tables
-instead of re-deriving history; parallel runs per date/store partition with
-per-partition atomic publication; raw-data retention tiering; and
-throughput/latency monitoring with volume-anomaly alerts. No technology
-beyond what scale requires.
+date with indexes and partition pruning; columnar formats (Parquet) and
+engines (DuckDB locally, or a managed warehouse/Fabric in Azure) for scan
+efficiency; bulk loading (PolyBase/COPY INTO); incremental merges into
+versioned and fact tables instead of re-deriving history; orchestrated
+parallel runs per date/store partition with per-partition atomic publication;
+raw-data retention tiering; and throughput/latency monitoring with
+volume-anomaly alerts. No technology beyond what scale requires.
 
 ## AI and tool use
 

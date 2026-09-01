@@ -1,260 +1,187 @@
 # Implementation Notes
 
-Engineering notes for the Dexwin take-home, describing the implementation
-currently present in this repository (`src/pipeline.py`,
-`sql/transformations.sql`, `tests/test_pipeline.py`). Sections that describe
-production or deployment behaviour are explicitly labelled as proposals, not
-implemented features.
+Describes how the submitted implementation works, based on the current
+`src/pipeline.py`, `sql/transformations.sql` and `tests/test_pipeline.py`.
 
-## 1. Architecture and Responsibilities
+## 1. Architecture
 
-Two layers with a clear boundary:
+```
+Python ingestion/validation  ->  SQLite staging  ->  SQL transformations  ->  deterministic exports
+```
 
-- **Python** (`src/pipeline.py`, standard library only, Python 3.10+):
-  CLI argument handling, reading CSV/JSONL sources, fatal schema checks,
-  per-row validation, staging of valid rows into an in-memory SQLite
-  database, executing the SQL script, and writing the four output files with
-  stable formatting and ordering.
-- **SQLite SQL** (`sql/transformations.sql`, executed via built-in
-  `sqlite3`): version selection, line and delivery facts, revenue lifecycle,
-  revenue events, as-of delivery state, daily store metrics, delayed alerts,
-  and data-quality counts.
+`src/pipeline.py` is the orchestrator. It reads the five source files, fails
+fast on structural problems, validates rows, inserts valid rows into
+in-memory SQLite staging tables, executes `sql/transformations.sql`, then
+queries the resulting tables and writes four output files. The SQLite
+database is `:memory:`; nothing persists between runs.
 
-All timestamps are ISO-8601 UTC text; lexicographic comparison is valid and
-is relied upon in SQL. No paid tools or external runtime dependencies are
-required; `requirements.txt` intentionally lists none.
+## 2. Python Responsibilities
 
-## 2. Data Grain and Relationships
+- CLI (`--data-dir`, `--output-dir`; defaults `data/`, `output/`).
+- Source loading: CSV via `csv.DictReader`, JSONL via `json.loads` per line;
+  missing files, missing headers, malformed JSON and non-object JSONL lines
+  raise `PipelineError` (fatal, exit 1).
+- Schema checks: every CSV must carry its required columns; every JSONL
+  record is independently checked for the required fields.
+- Row validation: identifiers non-blank; timestamps parsed with
+  `datetime.fromisoformat` (`Z` suffix); status/`event_type` restricted to
+  the allowed enums; numerics parsed with `Decimal`, required finite
+  (rejecting `NaN`/`Infinity` spellings that `float()` would accept), and
+  non-negative for `quantity`, `unit_price`, `discount_amount`, `unit_cost`.
+- Staging: valid rows inserted into `staging_*` tables plus a one-row
+  `pipeline_config` table carrying the assessment timestamp.
+- Orchestration and export: executes the SQL script, then formats and writes
+  outputs with stable ordering (documented sort keys), two-decimal money,
+  six-decimal rates, and JSONL one object per line.
 
-Orders are the hub. Every order-level record joins through `order_id`:
+Row-level validation failures are rejections (reported), not fatal errors.
 
-- `order_lines`: keyed and versioned by `line_id` + `updated_at`; facts at
-  line grain, only attached to known orders.
-- `order_status_events`: keyed and versioned by `event_id` + `updated_at`.
-- `delivery_events` (JSONL): keyed and versioned by `event_id` + `updated_at`.
-- `products`: joined to lines through `product_id` (left join; absence is a
-  data-quality finding, not a rejection).
+## 3. SQL Responsibilities
 
-Output grains:
+`sql/transformations.sql` (kept visible and unexecuted by Python logic) owns:
 
-- `revenue_events.csv` — one row per recognised SALE or REVERSAL (order x
-  event date).
-- `daily_store_metrics.csv` — one row per metric_date x store_id.
-- `delayed_delivery_alerts.jsonl` — one object per currently delayed order.
-- `data_quality_report.json` — one run-level document.
+- version selection and authoritative records (`v_*_ranked`, `v_current_*`),
+- line facts and order amounts (`v_line_facts`, `v_order_amounts`),
+- the revenue lifecycle (`v_first_completed`, `v_first_cancelled`,
+  `v_order_revenue`) and `result_revenue_events`,
+- delivery state: full-extract facts (`v_delivery_facts`) for metrics and a
+  separate as-of view (`v_asof_delivery`) for alerts,
+- `result_daily_store_metrics`, `result_delayed_delivery_alerts`,
+- `result_dq_counts` (duplicates, corrections, quarantined orphans,
+  unmatched products, source/authoritative row counts).
 
-## 3. Versioning and Corrections
+All timestamps are ISO-8601 UTC text, so lexicographic comparison is valid
+and is relied upon throughout.
 
-`updated_at` is the source-system version clock. For each business key, a
-`ROW_NUMBER()` window orders versions `updated_at DESC, rowid ASC`; rank 1 is
-authoritative. Version selection happens **before** any business
-interpretation, so a later corrected version can repair an originally invalid
-event (for example, a `COMPLETED` status whose first version carried a
-business timestamp before `ordered_at`, or a delivery whose corrected version
-moved the delivery earlier) — handled generically, with no order-specific
-logic in code or SQL.
+## 4. Versioning
 
-Business timestamps come from `event_ts`, never `updated_at`; `updated_at`
-only answers "which version is current".
+Each versioned source is ranked with
+`ROW_NUMBER() OVER (PARTITION BY <business key> ORDER BY updated_at DESC, rowid ASC)`;
+rank 1 is authoritative. `updated_at` is the source-system version clock and
+is used only to pick versions — business timing always uses `event_ts`.
+Version selection precedes validity checks (`event_ts >= ordered_at`, known
+order), so a corrected later version can repair an originally invalid event
+without special-casing any order.
 
-Exact-duplicate superseded rows (identical in every column to the
-authoritative row) are counted as duplicate extras and never double count.
-Superseded rows that differ from the authoritative row are counted as
-corrections. The two categories are computed by direct comparison against the
-kept row, not by counting `ROW_NUMBER() > 1` twice.
+Superseded rows are then classified against the kept row: identical in every
+column → **duplicate extra** (never double-counts); differing → **corrected
+version**. Limitations: equal-`updated_at` conflicts are tie-broken by
+first-loaded row (safe only for exact duplicates), and the comparison is
+raw-text, so `3` vs `3.0` classifies as a correction.
 
-Known limitations:
+## 5. Revenue Logic
 
-- Versions sharing an identical `updated_at` are tie-broken by first-loaded
-  row (`rowid ASC`), which is only meaningful for exact duplicates; genuinely
-  conflicting versions cannot be distinguished without a source sequence
-  number.
-- Duplicate-vs-correction classification compares raw staged text values, so
-  semantically equivalent representations such as `3` and `3.0` are
-  classified as a correction.
-
-## 4. Revenue Recognition
-
-- Line value = `quantity * unit_price - discount_amount`; order amount is the
-  sum over current lines of the known order.
-- The first **valid** `COMPLETED` event per order (valid = attached to a
-  known order and `event_ts >= ordered_at`, evaluated on authoritative
-  versions) creates exactly one SALE.
-- A `CANCELLED` event later than that completion creates an equal REVERSAL
-  (negated net revenue and known gross profit) dated on the cancellation's
+- Line value = `quantity * unit_price - discount_amount`; order revenue is
+  the sum over the order's current lines (orphan lines excluded).
+- First valid `COMPLETED` per order creates exactly one SALE, dated on its
   `event_ts`.
-- `CANCELLED` before `COMPLETED` produces no revenue at all.
-- `CREATED`/`PROCESSING`-only orders produce no revenue.
-- Event dates are derived from `event_ts` (`substr(...,1,10)`), not load or
-  version time.
-- Unknown products still contribute net revenue; their cost is unknown, so
-  `known_gross_profit` excludes those lines (NULL when no line has a known
-  cost — never coerced to zero).
-- The revenue extract is **not** cutoff at the assessment timestamp. In the
-  supplied data, order O030's cancellation on 2026-07-15 at 16:00Z is later
-  than the 09:00Z assessment instant yet still generates its reversal: the
-  assessment timestamp is used exclusively for delay-alert evaluation, not as
-  a global revenue cutoff. This is the implemented behaviour.
+- A `CANCELLED` event later than that completion creates an equal REVERSAL
+  (negated net revenue and known gross profit) on the cancellation date.
+- `CANCELLED` before `COMPLETED` → no revenue; `CREATED`/`PROCESSING`-only →
+  no revenue.
+- Unknown products keep their revenue; `known_gross_profit` covers only lines
+  with a known cost (NULL when none, never zero).
+- The revenue extract has no assessment cutoff; `2026-07-15T09:00:00Z` is
+  used only for delay-alert evaluation (the supplied 16:00 cancellation on
+  the assessment day therefore still reverses).
 
-## 5. Delivery and Alert Logic
+## 6. Delivery Logic
 
-- Delivery performance uses the first valid `DELIVERED` event per known
-  order (again after version selection, `event_ts >= ordered_at`).
-- `delivered_at <= promised_delivery_at` is on time (boundary inclusive).
-- Alerts are evaluated as of `2026-07-15T09:00:00Z` via a separate as-of view
-  that ignores delivery events with `event_ts` after the assessment
-  timestamp. An order actually delivered later than the assessment time is
-  therefore alerted on the "not delivered by promise" branch as of the
-  snapshot.
-- Historical daily metrics are computed from the full-extract delivery facts
-  and are **not** limited by the assessment timestamp, so later deliveries
-  still appear in delivered/on-time measures on their business date.
-- A missing delivery is alerted only once the promise has passed
-  (`promised_delivery_at <= assessment_ts`).
-- Orphan delivery events (unknown `order_id`) never attach to orders; they
-  are counted and reported as quarantined.
-- Alert reasons currently emitted: `delivered_late` and
-  `not_delivered_by_promise`. Cancelled orders are not excluded from alerts
-  (an open business question documented in `DESIGN_NOTES.md`).
+Two views, two time semantics:
 
-## 6. Data Quality and Validation
+- **Historical** (`v_delivery_facts`): first valid `DELIVERED` event per
+  known order over the full extract; `delivered_at <= promised_delivery_at`
+  is on time (boundary inclusive). Daily metrics use this view and are not
+  cutoff-limited.
+- **As-of** (`v_asof_delivery`): identical logic restricted to
+  `event_ts <= assessment_ts`, used only by
+  `result_delayed_delivery_alerts`. Orders delivered late within the window
+  alert as `delivered_late`; undelivered-with-passed-promise alert as
+  `not_delivered_by_promise`; future promises do not alert. Cancelled orders
+  are not excluded (documented open business question).
 
-Python validation:
+Orphan delivery events never join to orders; they are counted and reported
+as quarantined.
 
-- Header/schema checks for all four CSVs; missing source files, missing
-  headers and missing required columns are fatal (`PipelineError`, exit 1).
-- JSONL: invalid JSON or non-object lines are fatal; every record is
-  independently checked for required fields, identifiers, allowed
-  `event_type`, and parseable timestamps.
-- Timestamps parsed with `datetime.fromisoformat` (`Z` suffix supported).
-- Numerics parsed with `Decimal` and required to be finite (`NaN`,
-  `Infinity`, `-Infinity` and other non-parsable spellings are rejected);
-  `quantity`, `unit_price`, `discount_amount` and `unit_cost` must also be
-  non-negative (revenue corrections are modelled as new versions and
-  CANCELLED events, never signed amounts).
-- Status values must be in `CREATED/PROCESSING/COMPLETED/CANCELLED`.
+## 7. Data Quality
 
-Reporting vocabulary (each is distinct):
+The report keeps six distinct categories:
 
-- **Rejected rows** — source lines failing validation (whole row excluded
-  from staging).
-- **Validation errors** — messages raised; one row can raise several.
+- **Rejected rows** — source lines failing validation (whole row excluded);
+  **validation errors** — messages raised (one row can raise several); each
+  cites source file and line number.
 - **Duplicates** — superseded versions identical to the authoritative row.
-- **Corrections** — superseded versions differing from the authoritative row.
-- **Quarantined records** — orphan lines, status events or delivery events
-  attached to unknown orders.
-- **Unmatched** — current lines whose `product_id` is absent from products;
-  revenue stands, cost is unknown.
+- **Corrections** — superseded versions differing from it.
+- **Quarantined** — current records referencing unknown orders (lines,
+  status events, delivery events counted separately).
+- **Unmatched** — current lines with unknown `product_id`; revenue stands,
+  cost unknown.
 
-## 7. Output Contracts
+Plus raw, staged and authoritative row counts for reconciliation.
 
-- `output/revenue_events.csv` — auditable order-level revenue events
-  (`event_date, order_id, store_id, event_type, net_revenue,
-  known_gross_profit`); money formatted to two decimals, empty GP means
-  unknown.
-- `output/daily_store_metrics.csv` — store/day aggregate: revenue measures,
-  completed/reversed order counts, delivered and on-time counts, and
-  `on_time_delivery_rate` (six decimals; empty when no deliveries).
-- `output/delayed_delivery_alerts.jsonl` — one JSON object per delayed order
-  with `order_id, store_id, promised_delivery_at, delivered_at, reason`
-  (`delivered_at` null for undelivered orders).
-- `output/data_quality_report.json` — run document with the six DQ
-  categories above, per-source rejection detail with file line numbers, and
-  raw/authoritative row counts, plus the assessment timestamp used.
+## 8. Output Contracts
 
-Ordering in all files is deterministic (documented sort keys).
+- `output/revenue_events.csv` — grain: order x recognised event. Columns:
+  `event_date, order_id, store_id, event_type, net_revenue,
+  known_gross_profit`. Money two decimals; empty GP means unknown.
+- `output/daily_store_metrics.csv` — grain: metric_date x store_id. Columns:
+  revenue measures, `completed_orders`, `reversed_orders`,
+  `delivered_orders`, `on_time_deliveries`, `on_time_delivery_rate` (six
+  decimals; empty when no deliveries).
+- `output/delayed_delivery_alerts.jsonl` — grain: currently delayed order.
+  Keys: `order_id, store_id, promised_delivery_at, delivered_at, reason`
+  (`delivered_at` null when undelivered).
+- `output/data_quality_report.json` — run document: `assessment_ts`,
+  `rejected` (rows/validation_errors/by_source/errors), `quarantined`,
+  `duplicate`, `corrected`, `unmatched`, and row-count sections.
 
-## 8. Testing Strategy
+## 9. Testing
 
-`tests/test_pipeline.py` uses standard-library `unittest` with synthetic
-minimal fixtures in temporary directories (repo `output/` is never touched by
-tests), asserting only on documented outputs. 22 tests cover: supplied-dataset
-end-to-end run via the real CLI plus output-format contracts; exact-duplicate
-lines; latest line/status/delivery version wins; single SALE from multiple
-completions; equal reversal after cancellation; cancel-before-complete and
-processing-only producing no revenue; unknown products keeping revenue
-without GP; orphan delivery quarantine; late-delivery and missing-delivery
-alerts; future promise producing no alert; deliveries after the assessment
-time excluded from alert state but kept in historical metrics; inclusive
-on-time boundary; NaN/Infinity/negative numerics rejected; malformed JSONL
-records rejected non-fatally; fatal invalid JSON, missing columns and missing
-files; and the full supplied-data regression totals.
+`tests/test_pipeline.py` — 22 tests, standard-library `unittest`, no
+third-party packages. Synthetic minimal fixtures run through `pipeline.run`
+in temporary directories (repo `output/` is never used by tests), asserting
+only on documented outputs. Coverage: supplied-dataset end-to-end via the
+real CLI plus regression totals and format contracts; duplicate lines;
+latest line/status/delivery version selection; single SALE per order; equal
+reversal; cancel-before-complete and processing-only → no revenue; unknown
+products; orphan quarantine; late/missing/future-promise alerts;
+assessment-time exclusion for alerts vs historical metrics; inclusive
+on-time boundary; NaN/Infinity/negative rejection; malformed JSONL rejection
+(non-fatal); fatal invalid JSON/missing columns/missing files.
 
-## 9. Idempotency, Retries and Operational Considerations
+## 10. Reproducibility
 
-The take-home run is effectively idempotent: outputs are regenerated
-deterministically from the source snapshot, SQLite state is in-memory with no
-persistent residue, the output directory and files are rewritten each run,
-and version selection plus duplicate reporting prevent re-supplied source
-versions from double counting. Operational design considerations (not
-implemented here): production retries should key batches by file/batch id,
-alert delivery needs a stable `(order_id, assessment_window)` business key
-with an acknowledgement state store so reruns update rather than duplicate
-alerts, and failures should distinguish transient (retry with backoff) from
-structural (fail fast, quarantine).
+```bash
+python3 src/pipeline.py --data-dir data --output-dir output
+python3 -m unittest discover -s tests -v
+```
 
-## 10. Scaling to 100x Volume
+The output directory is created when required, the database is in-memory,
+and outputs are fully regenerated and deterministic on every run. No
+network, credentials or persistent state are involved.
 
-Not implemented, but the natural escalation path if volumes grow: stream
-source files rather than holding all parsed rows in memory; keep
-`executemany` batching (already used) and add indexes on join/version keys
-(`order_id`, business key + `updated_at`); process per-day or per-store
-partitions incrementally instead of full reloads; persist state (SQLite file
-or a client-server analytical database) if in-memory SQLite becomes the
-bottleneck; and parallelise load/transform per partition with atomic
-per-partition publication. The versioned-event model already supports
-incremental merge semantics.
+## 11. Design Trade-offs
 
-## 11. BI / Reporting Use
-
-- `revenue_events` — transaction/event fact for drill-through and reversal
-  auditing.
-- `daily_store_metrics` — store/day aggregate serving management reporting,
-  joinable on date and store dimensions.
-- `delayed_delivery_alerts` — operational exception feed for store teams,
-  not a history table.
-- `data_quality_report` — pipeline monitoring metadata (rejection and
-  quarantine trends, row-count reconciliation).
-
-Business logic lives upstream in the pipeline so reports stay consistent.
-
-## 12. Deployment Considerations
-
-Proposed only — this assessment runs locally. In a Microsoft-oriented
-environment: source and curated files in Azure Blob Storage / Data Lake; the
-Python job containerised and scheduled by Azure Data Factory or Fabric
-pipelines; result tables or files consumed by Power BI; identity via
-Microsoft Entra ID with managed identities for least-privilege storage
-access; secrets in Azure Key Vault; logs/metrics in Azure Monitor. Failure
-handling, replay from retained immutable sources, and alert idempotency per
-sections 3/9 would be configured at the orchestrator layer.
-
-## 13. AI Assistance Disclosure
-
-AI assistance (Cursor's coding assistant) was used during development for
-code review, test design, edge-case identification, documentation refinement,
-and general reasoning support. Every generated suggestion was reviewed against
-the assignment requirements; the submitted implementation and documentation
-were validated by running the supplied dataset end-to-end and the automated
-test suite.
-
-## 14. Known Limitations and Assumptions
-
-Supported by the current implementation:
-
-- Duplicate-vs-correction classification compares raw staged text, so
-  `3` vs `3.0` counts as a correction.
-- Conflicting versions with identical `updated_at` are tie-broken by
-  first-loaded row, which cannot distinguish genuine disagreements.
-- `customer_id` and `category` are required in headers but carry no value
-  validation; they are not used by any rule, so validation is intentionally
-  limited.
-- The assessment timestamp is a Python constant injected into the SQL layer
-  through a one-row `pipeline_config` table; changing the run date requires
-  a code change (no CLI flag currently exposes it).
-- A row failing any validation is rejected whole; its other valid fields are
-  not field-level quarantined or partially staged.
-- Supplied-dataset regression totals are hard-coded in the test suite by
-  design (a regression lock); they must be revisited if `data/` changes.
-- Revenue assumes order lines are complete per order; partial-line extracts
-  are out of scope and undetectable from the sources.
+- **SQLite**: preinstalled with Python, real SQL, zero setup — matches the
+  brief's requirement for visible SQL without new infrastructure. The
+  in-memory choice removes cleanup and cross-run state entirely; dataset
+  size makes the full reload cheap.
+- **No third-party runtime dependencies**: the pipeline itself uses only the
+  standard library. `requirements.txt` pins the optional notebook analysis
+  environment (`notebook`, `ipykernel`, `pandas`, `matplotlib`, `seaborn`)
+  for CPython 3.13.5; the committed notebook imports none of them directly
+  beyond running under the pinned Jupyter kernel. Pipeline and tests need
+  only `python3`.
+  `csv`/`json`/`sqlite3`/`decimal` cover the job; fewer moving parts means
+  the reviewer reproduces it with only Python 3.10+.
+- **SQL stays in `sql/transformations.sql`** rather than embedded strings, so
+  the transformation layer is diffable and reviewable on its own.
+- **Row-level rejects over partial staging**: rejecting the whole row keeps
+  staging uniform; field-level quarantine would add complexity the brief
+  does not need.
+- **No dashboard or automation flow**: the assignment asks for design
+  documentation, not implementation (`DESIGN_NOTES.md` covers the proposed
+  production architecture explicitly as non-implemented).
+- **`notebooks/data_investigation.ipynb`** is a read-only working paper that
+  reuses production helpers to inspect the same result layer; it is not part
+  of the pipeline and writes no files.
